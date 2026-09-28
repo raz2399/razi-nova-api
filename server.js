@@ -59,8 +59,7 @@ async function initDB() {
       exported    BOOLEAN DEFAULT FALSE,
       export_date DATE,
       store       TEXT NOT NULL DEFAULT 'razco-lindsay',
-      synced_at   TIMESTAMP DEFAULT NOW(),
-      UNIQUE(batch_id, store, (synced_at::date))
+      synced_at   TIMESTAMP DEFAULT NOW()
     );
 
     CREATE TABLE IF NOT EXISTS actions (
@@ -187,9 +186,7 @@ app.post("/api/brdata/batches/sync", async (req, res) => {
       await pool.query(`
         INSERT INTO brdata_batches (batch_id,batch_name,description,item_count,exported,export_date,store,synced_at)
         VALUES ($1,$2,$3,$4,$5,$6,$7,NOW())
-        ON CONFLICT (batch_id,store,(synced_at::date)) DO UPDATE SET
-          batch_name=EXCLUDED.batch_name, item_count=EXCLUDED.item_count,
-          exported=EXCLUDED.exported, synced_at=NOW()
+        ON CONFLICT DO NOTHING
       `,[b.id,b.name,b.description||"",b.itemCount||0,b.exported||false,b.exportDate||null,store]);
     }
     res.json({ ok:true, synced:batches.length });
@@ -200,7 +197,7 @@ app.post("/api/brdata/batches/sync", async (req, res) => {
 app.get("/api/brdata/batches/today", async (req, res) => {
   try {
     const { store="razco-lindsay" } = req.query;
-    const r = await pool.query(`SELECT batch_id,batch_name,description,item_count,exported,synced_at FROM brdata_batches WHERE store=$1 AND synced_at::date=CURRENT_DATE ORDER BY batch_id ASC`,[store]);
+    const r = await pool.query(`SELECT batch_id,batch_name,description,item_count,exported,synced_at FROM brdata_batches WHERE store=$1 AND synced_at >= CURRENT_DATE::timestamp ORDER BY batch_id ASC`,[store]);
     res.json({ batches:r.rows, count:r.rows.length });
   } catch(e) { res.status(500).json({ error:e.message }); }
 });
