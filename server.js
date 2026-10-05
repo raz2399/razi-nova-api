@@ -11,7 +11,13 @@ const {
 const app  = express();
 const PORT = process.env.PORT || 3000;
 
-app.use(cors({ origin: "*" }));
+app.use(cors({
+  origin: ["https://dulcet-manatee-727738.netlify.app", "http://localhost:3000", "*"],
+  methods: ["GET","POST","PUT","PATCH","DELETE","OPTIONS"],
+  allowedHeaders: ["Content-Type","Authorization"],
+  credentials: false
+}));
+app.options("*", cors());
 app.use(express.json({ limit: "10mb" }));
 
 const pool = new Pool({
