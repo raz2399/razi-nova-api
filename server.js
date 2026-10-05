@@ -343,6 +343,122 @@ app.get("/api/actions/clerk-tasks", async (req, res) => {
   } catch(e) { res.status(500).json({ error:e.message }); }
 });
 
+// ── EMPLOYEE ROUTES — add to server.js ───────────────────────
+
+async function initEmployeesTable() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS employees (
+      id          TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
+      name        TEXT NOT NULL,
+      role        TEXT NOT NULL DEFAULT 'clerk',
+      store       TEXT NOT NULL DEFAULT 'razco-lindsay',
+      pin_hash    TEXT,
+      pin_set     BOOLEAN DEFAULT FALSE,
+      active      BOOLEAN DEFAULT TRUE,
+      notif_token TEXT,
+      created_at  TIMESTAMP DEFAULT NOW(),
+      updated_at  TIMESTAMP DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_emp_store  ON employees(store);
+    CREATE INDEX IF NOT EXISTS idx_emp_active ON employees(active);
+  `);
+  console.log("Employees table ready");
+}
+
+// Simple PIN hash — not bcrypt to keep it lightweight
+function hashPin(pin) {
+  const crypto = require("crypto");
+  return crypto.createHash("sha256").update(pin + "razco-salt-2026").digest("hex");
+}
+
+// Get all employees
+app.get("/api/employees", async (req, res) => {
+  try {
+    const { store, active } = req.query;
+    let q = "SELECT id,name,role,store,pin_set,active,created_at FROM employees WHERE 1=1";
+    const vals = [];
+    let idx = 1;
+    if (store && store !== "both") { q += ` AND (store=$${idx++} OR store='both')`; vals.push(store); }
+    if (active !== undefined)      { q += ` AND active=$${idx++}`; vals.push(active === "true"); }
+    q += " ORDER BY name ASC";
+    const r = await pool.query(q, vals);
+    res.json({ employees: r.rows });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// Add employee
+app.post("/api/employees", async (req, res) => {
+  try {
+    const { name, role="clerk", store="razco-lindsay" } = req.body;
+    if (!name) return res.status(400).json({ error: "name required" });
+    const r = await pool.query(
+      `INSERT INTO employees (name,role,store,pin_hash,pin_set) VALUES ($1,$2,$3,$4,FALSE) RETURNING id,name,role,store,pin_set,active`,
+      [name.trim(), role, store, hashPin("0000")]
+    );
+    res.json({ employee: r.rows[0] });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// Update employee
+app.patch("/api/employees/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { active, role, store, notifToken } = req.body;
+    const sets = ["updated_at=NOW()"];
+    const vals = [id];
+    let idx = 2;
+    if (active !== undefined) { sets.push(`active=$${idx++}`); vals.push(active); }
+    if (role)       { sets.push(`role=$${idx++}`);        vals.push(role); }
+    if (store)      { sets.push(`store=$${idx++}`);       vals.push(store); }
+    if (notifToken) { sets.push(`notif_token=$${idx++}`); vals.push(notifToken); }
+    await pool.query(`UPDATE employees SET ${sets.join(",")} WHERE id=$1`, vals);
+    res.json({ ok: true });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// Verify PIN
+app.post("/api/employees/verify-pin", async (req, res) => {
+  try {
+    const { employeeId, pin } = req.body;
+    if (!employeeId || !pin) return res.status(400).json({ error: "employeeId and pin required" });
+    const r = await pool.query("SELECT id,name,pin_hash,pin_set,active FROM employees WHERE id=$1", [employeeId]);
+    if (!r.rows.length) return res.json({ valid: false, reason: "not found" });
+    const emp = r.rows[0];
+    if (!emp.active) return res.json({ valid: false, reason: "inactive" });
+    const valid = emp.pin_hash === hashPin(pin);
+    const mustSetPin = valid && !emp.pin_set; // first login with default 0000
+    res.json({ valid, mustSetPin });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// Set PIN (first login or change)
+app.post("/api/employees/set-pin", async (req, res) => {
+  try {
+    const { employeeId, pin } = req.body;
+    if (!employeeId || !pin || pin.length !== 4) return res.status(400).json({ error: "employeeId and 4-digit pin required" });
+    await pool.query(
+      "UPDATE employees SET pin_hash=$1, pin_set=TRUE, updated_at=NOW() WHERE id=$2",
+      [hashPin(pin), employeeId]
+    );
+    res.json({ ok: true });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// Reset PIN to 0000
+app.post("/api/employees/reset-pin", async (req, res) => {
+  try {
+    const { employeeId } = req.body;
+    if (!employeeId) return res.status(400).json({ error: "employeeId required" });
+    await pool.query(
+      "UPDATE employees SET pin_hash=$1, pin_set=FALSE, updated_at=NOW() WHERE id=$2",
+      [hashPin("0000"), employeeId]
+    );
+    res.json({ ok: true });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+initEmployeesTable().catch(console.error);
+
 // ── START ─────────────────────────────────────────────────────
 initDB()
   .then(() => app.listen(PORT, () => console.log(`Razi-Nova API v2 on port ${PORT}`)))
