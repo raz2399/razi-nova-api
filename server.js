@@ -11,13 +11,14 @@ const {
 const app  = express();
 const PORT = process.env.PORT || 3000;
 
-app.use(cors({
-  origin: ["https://dulcet-manatee-727738.netlify.app", "http://localhost:3000", "*"],
-  methods: ["GET","POST","PUT","PATCH","DELETE","OPTIONS"],
-  allowedHeaders: ["Content-Type","Authorization"],
-  credentials: false
-}));
-app.options("*", cors());
+// Allow all origins — Razi-Nova is internal, no public security risk
+app.use((req, res, next) => {
+  res.header("Access-Control-Allow-Origin", "*");
+  res.header("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS");
+  res.header("Access-Control-Allow-Headers", "Content-Type,Authorization");
+  if (req.method === "OPTIONS") return res.sendStatus(200);
+  next();
+});
 app.use(express.json({ limit: "10mb" }));
 
 const pool = new Pool({
