@@ -204,7 +204,8 @@ app.post("/api/brdata/batches/sync", async (req, res) => {
 app.get("/api/brdata/batches/today", async (req, res) => {
   try {
     const { store="razco-lindsay" } = req.query;
-    const r = await pool.query(`SELECT batch_id,batch_name,description,item_count,exported,synced_at FROM brdata_batches WHERE store=$1 AND synced_at >= CURRENT_DATE::timestamp ORDER BY batch_id ASC`,[store]);
+    // One row per batch (the bridge re-syncs every 6h) — newest sync wins. "Today" = Pacific day.
+    const r = await pool.query(`SELECT DISTINCT ON (batch_id) batch_id,batch_name,description,item_count,exported,synced_at FROM brdata_batches WHERE store=$1 AND synced_at >= ((NOW() AT TIME ZONE 'America/Los_Angeles')::date)::timestamp AT TIME ZONE 'America/Los_Angeles' ORDER BY batch_id ASC, synced_at DESC`,[store]);
     res.json({ batches:r.rows, count:r.rows.length });
   } catch(e) { res.status(500).json({ error:e.message }); }
 });
@@ -261,7 +262,7 @@ app.post("/api/actions/price-suggest", async (req, res) => {
 // Raz approves — batchId is required (Raz picks from today's list)
 app.post("/api/actions/approve", async (req, res) => {
   try {
-    const { item, actionType, finalPrice, tprEndDate, batchId, batchName, store="razco-lindsay" } = req.body;
+    const { item, actionType, finalPrice, tprEndDate, batchId, batchName, clerkName, store="razco-lindsay" } = req.body;
     if (!item||!actionType) return res.status(400).json({ error:"item and actionType required" });
     if (!batchId)           return res.status(400).json({ error:"batchId required" });
 
@@ -273,12 +274,13 @@ app.post("/api/actions/approve", async (req, res) => {
     action.batchId   = batchId;
     action.batchName = batchName || `Batch ${batchId}`;
     if (finalPrice) action.finalPrice = finalPrice;
+    action.clerkName = (clerkName && String(clerkName).trim()) || null; // assigned clerk (null = any clerk)
 
     await pool.query(`
-      INSERT INTO actions (id,item_id,upc,description,dept,aisle,qty,days_left,expiry_date,current_retail,cost,action_type,batch_id,batch_name,suggested_price,final_price,discount_pct,margin_pct,floor_price,customer_saves,tpr_start,tpr_end,state,state_history,store)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25)
+      INSERT INTO actions (id,item_id,upc,description,dept,aisle,qty,days_left,expiry_date,current_retail,cost,action_type,batch_id,batch_name,suggested_price,final_price,discount_pct,margin_pct,floor_price,customer_saves,tpr_start,tpr_end,state,state_history,store,clerk_name)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26)
       ON CONFLICT (id) DO NOTHING
-    `,[action.id,action.itemId,action.upc,action.description,action.dept,action.aisle,action.qty,action.daysLeft,action.expiryDate,action.currentRetail,action.cost,action.actionType,action.batchId,action.batchName,action.suggestedPrice,action.finalPrice,action.discountPct,action.marginPct,action.floorPrice,action.customerSaves,action.tprStartDate,action.tprEndDate,action.state,JSON.stringify(action.stateHistory),store]);
+    `,[action.id,action.itemId,action.upc,action.description,action.dept,action.aisle,action.qty,action.daysLeft,action.expiryDate,action.currentRetail,action.cost,action.actionType,action.batchId,action.batchName,action.suggestedPrice,action.finalPrice,action.discountPct,action.marginPct,action.floorPrice,action.customerSaves,action.tprStartDate,action.tprEndDate,action.state,JSON.stringify(action.stateHistory),store,action.clerkName]);
 
     res.json({ ok:true, actionId:action.id, batch:buildBRdataBatchEntry(action) });
   } catch(e) {
@@ -333,9 +335,14 @@ app.get("/api/actions/board", async (req, res) => {
 // Clerk task list — sorted by urgency (lowest days_left first)
 app.get("/api/actions/clerk-tasks", async (req, res) => {
   try {
-    const { store="razco-lindsay" } = req.query;
-    const today = new Date().toISOString().slice(0,10);
-    const r = await pool.query(`SELECT * FROM actions WHERE store=$1 AND created_at>=$2::date AND state IN ('label_ready','approved') ORDER BY days_left ASC`,[store,today]);
+    const { store="razco-lindsay", clerkName="" } = req.query;
+    // Open tasks from the last 14 days (a label not placed yesterday must still show today).
+    // Assigned to this clerk, or assigned to nobody (= any clerk).
+    const r = await pool.query(
+      `SELECT * FROM actions WHERE store=$1 AND created_at >= NOW() - INTERVAL '14 days'
+         AND state IN ('label_ready','approved')
+         AND (clerk_name IS NULL OR clerk_name='' OR $2='' OR LOWER(clerk_name)=LOWER($2))
+       ORDER BY days_left ASC`,[store,String(clerkName)]);
     res.json({
       print_labels: r.rows.filter(row=>row.state==="label_ready").map(row=>({
         actionId:row.id, upc:row.upc, description:row.description, aisle:row.aisle,
@@ -466,7 +473,12 @@ app.post("/api/employees/reset-pin", async (req, res) => {
 
 initEmployeesTable().catch(console.error);
 
+// ── V8 MODULES — day run, aisle walk, TPR check, verify, tasks, Telegram ──
+// Lives in razi-modules.js. If it ever fails to start, the core API above keeps running.
+const raziModules = require("./razi-modules")(app, pool);
+
 // ── START ─────────────────────────────────────────────────────
 initDB()
+  .then(() => raziModules.init())
   .then(() => app.listen(PORT, () => console.log(`Razi-Nova API v2 on port ${PORT}`)))
   .catch(err => { console.error("DB init failed:", err.message); process.exit(1); });
