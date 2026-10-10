@@ -241,6 +241,15 @@ module.exports = function raziModules(app, pool) {
         );
         CREATE INDEX IF NOT EXISTS idx_verify_store ON verify_tasks(store, status);
 
+        CREATE TABLE IF NOT EXISTS brdata_exports (
+          store       TEXT NOT NULL,
+          export_date DATE NOT NULL,
+          batch_no    TEXT NOT NULL,
+          items       INTEGER DEFAULT 0,
+          exported_at TIMESTAMPTZ DEFAULT NOW(),
+          PRIMARY KEY (store, export_date, batch_no)
+        );
+
         CREATE TABLE IF NOT EXISTS manager_tasks (
           id           SERIAL PRIMARY KEY,
           store        TEXT NOT NULL,
@@ -579,6 +588,36 @@ module.exports = function raziModules(app, pool) {
     else if (done === true) await pool.query("UPDATE manager_tasks SET status='done', done_by=$2, done_at=NOW(), note=$3 WHERE id=$1", [req.params.id, clerkName || null, String(note).slice(0, 300)]);
     else if (done === false) await pool.query("UPDATE manager_tasks SET status='open', done_by=NULL, done_at=NULL WHERE id=$1", [req.params.id]);
     res.json({ ok:true });
+  }));
+
+  // ── BRDATA EXPORTED BATCHES (read-only feed from the bridge) ─
+  // The bridge reads C:\brdata\expout.txt, sees which batches were exported
+  // today and posts them here. The app auto-ticks those batches.
+  app.post("/api/brdata/exported", wrap(async (req, res) => {
+    const { store = DEFAULT_STORE, batches } = req.body || {};
+    if (!Array.isArray(batches)) return res.status(400).json({ error:"batches[] required" });
+    const date = ptParts().date;
+    let n = 0;
+    for (const b of batches.slice(0, 200)) {
+      const digits = String(b.batch == null ? "" : b.batch).replace(/\D/g, "");
+      if (!digits) continue;
+      const no = digits.padStart(3, "0").slice(-3);
+      const items = Math.max(0, parseInt(b.items, 10) || 0);
+      const at = b.exportedAt && !isNaN(new Date(b.exportedAt)) ? new Date(b.exportedAt) : new Date();
+      await pool.query(
+        `INSERT INTO brdata_exports (store,export_date,batch_no,items,exported_at) VALUES ($1,$2,$3,$4,$5)
+         ON CONFLICT (store,export_date,batch_no) DO UPDATE SET items=EXCLUDED.items, exported_at=GREATEST(brdata_exports.exported_at, EXCLUDED.exported_at)`,
+        [store, date, no, items, at]);
+      n++;
+    }
+    res.json({ ok:true, saved:n, date });
+  }));
+
+  app.get("/api/brdata/exported/today", wrap(async (req, res) => {
+    const store = req.query.store || DEFAULT_STORE;
+    const date = ptParts().date;
+    const r = await pool.query("SELECT batch_no, items, exported_at FROM brdata_exports WHERE store=$1 AND export_date=$2 ORDER BY exported_at", [store, date]);
+    res.json({ date, batches: r.rows.map(x => ({ batch:x.batch_no, items:x.items, exportedAt:x.exported_at })) });
   }));
 
   // ── TELEGRAM STATUS ─────────────────────────────────────────
