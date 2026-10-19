@@ -249,6 +249,7 @@ module.exports = function raziModules(app, pool) {
           exported_at TIMESTAMPTZ DEFAULT NOW(),
           PRIMARY KEY (store, export_date, batch_no)
         );
+        ALTER TABLE brdata_exports ADD COLUMN IF NOT EXISTS items_json JSONB;
 
         CREATE TABLE IF NOT EXISTS manager_tasks (
           id           SERIAL PRIMARY KEY,
@@ -604,10 +605,13 @@ module.exports = function raziModules(app, pool) {
       const no = digits.padStart(3, "0").slice(-3);
       const items = Math.max(0, parseInt(b.items, 10) || 0);
       const at = b.exportedAt && !isNaN(new Date(b.exportedAt)) ? new Date(b.exportedAt) : new Date();
+      const list = Array.isArray(b.list) ? b.list.slice(0, 400).map(x => ({
+        upc: String(x.upc || "").slice(0, 20), desc: String(x.desc || "").slice(0, 60),
+        price: x.price == null || isNaN(Number(x.price)) ? null : Number(x.price) })) : null;
       await pool.query(
-        `INSERT INTO brdata_exports (store,export_date,batch_no,items,exported_at) VALUES ($1,$2,$3,$4,$5)
-         ON CONFLICT (store,export_date,batch_no) DO UPDATE SET items=EXCLUDED.items, exported_at=GREATEST(brdata_exports.exported_at, EXCLUDED.exported_at)`,
-        [store, date, no, items, at]);
+        `INSERT INTO brdata_exports (store,export_date,batch_no,items,exported_at,items_json) VALUES ($1,$2,$3,$4,$5,$6)
+         ON CONFLICT (store,export_date,batch_no) DO UPDATE SET items=EXCLUDED.items, items_json=COALESCE(EXCLUDED.items_json, brdata_exports.items_json), exported_at=GREATEST(brdata_exports.exported_at, EXCLUDED.exported_at)`,
+        [store, date, no, items, at, list ? JSON.stringify(list) : null]);
       n++;
     }
     res.json({ ok:true, saved:n, date });
@@ -616,8 +620,8 @@ module.exports = function raziModules(app, pool) {
   app.get("/api/brdata/exported/today", wrap(async (req, res) => {
     const store = req.query.store || DEFAULT_STORE;
     const date = ptParts().date;
-    const r = await pool.query("SELECT batch_no, items, exported_at FROM brdata_exports WHERE store=$1 AND export_date=$2 ORDER BY exported_at", [store, date]);
-    res.json({ date, batches: r.rows.map(x => ({ batch:x.batch_no, items:x.items, exportedAt:x.exported_at })) });
+    const r = await pool.query("SELECT batch_no, items, exported_at, items_json FROM brdata_exports WHERE store=$1 AND export_date=$2 ORDER BY exported_at", [store, date]);
+    res.json({ date, batches: r.rows.map(x => ({ batch:x.batch_no, items:x.items, exportedAt:x.exported_at, list:x.items_json || [] })) });
   }));
 
   // ── TELEGRAM STATUS ─────────────────────────────────────────
