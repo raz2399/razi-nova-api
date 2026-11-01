@@ -22,7 +22,7 @@ const MANAGER_PIN   = process.env.MANAGER_PIN || "1234";
 const CUTOFF_HOUR   = parseInt(process.env.WALK_CUTOFF_HOUR || "19", 10); // missed-aisle alert (PT)
 const REPORT_HOUR   = parseInt(process.env.REPORT_HOUR || "20", 10);      // end-of-day report (PT)
 const MIN_AISLE_SEC = parseInt(process.env.MIN_AISLE_SECONDS || "30", 10);
-const STEP_LABELS   = ["Today's Focus","TPR Check","Pull Tags","Process Batches","Expiry","Aisle Walk","Assigned Tasks","End of Shift"];
+const STEP_LABELS   = ["Batches & TPR","Aisle TPR","Pull","Aisle walk","Raz's tasks","Finish shift"];
 const DAY_NAMES     = ["Sunday","Monday","Tuesday","Wednesday","Thursday","Friday","Saturday"];
 
 // Lindsay QR zones — same QR codes already printed for the Shelf system
@@ -241,6 +241,19 @@ module.exports = function raziModules(app, pool) {
         );
         CREATE INDEX IF NOT EXISTS idx_verify_store ON verify_tasks(store, status);
 
+        ALTER TABLE tpr_decisions ADD COLUMN IF NOT EXISTS lead_name TEXT;
+        CREATE TABLE IF NOT EXISTS aisle_tpr (
+          store       TEXT NOT NULL,
+          week_start  DATE NOT NULL,
+          zone_code   TEXT NOT NULL,
+          items       INTEGER NOT NULL,
+          discount    NUMERIC(5,2) NOT NULL,
+          in_brdata   BOOLEAN DEFAULT FALSE,
+          clerk_name  TEXT,
+          note        TEXT,
+          created_at  TIMESTAMPTZ DEFAULT NOW(),
+          PRIMARY KEY (store, week_start, zone_code)
+        );
         CREATE TABLE IF NOT EXISTS brdata_exports (
           store       TEXT NOT NULL,
           export_date DATE NOT NULL,
@@ -307,8 +320,7 @@ module.exports = function raziModules(app, pool) {
     return (await pool.query("SELECT * FROM aisle_zones WHERE store=$1 ORDER BY walk_order, code", [store])).rows;
   }
   function randomZoneCodes(date, zones) {
-    const k = weekdayOf(date) === 4 ? 4 : 2; // Thursday = random-TPR day
-    return seededPick(date, zones.map(z => z.code), Math.min(k, zones.length));
+    return []; // the daily random-TPR check was retired — aisle TPR is now its own job (every other week)
   }
 
   // ── DAY RUN ─────────────────────────────────────────────────
@@ -350,6 +362,11 @@ module.exports = function raziModules(app, pool) {
     const { store = DEFAULT_STORE, clerkName, note = "", incomplete = [] } = req.body || {};
     if (!clerkName) return res.status(400).json({ error:"clerkName required" });
     const date = ptParts().date;
+    // Every job before "Finish shift" must be done — no skipping
+    const runRow = (await pool.query("SELECT steps_complete FROM day_runs WHERE store=$1 AND run_date=$2", [store, date])).rows[0];
+    const doneSteps = (runRow && runRow.steps_complete) || [];
+    const missing = STEP_LABELS.slice(0, STEP_LABELS.length - 1).filter((l, i) => !doneSteps.includes(i));
+    if (missing.length) return res.status(409).json({ error:"steps_incomplete", message:`Not finished: ${missing.join(", ")}`, missing });
     await pool.query(
       `INSERT INTO day_runs (store,run_date,confirmed_at,confirmed_by,confirm_note,incomplete,updated_by,updated_at)
        VALUES ($1,$2,NOW(),$3,$4,$5,$3,NOW())
@@ -476,22 +493,52 @@ module.exports = function raziModules(app, pool) {
   }));
 
   // ── TPR CHECK ───────────────────────────────────────────────
+  // Store lead = an active employee with role "manager", or Raz's master PIN
+  const leadFails = {};
+  async function verifyLead(pin, store) {
+    pin = String(pin || "");
+    if (!/^\d{4}$/.test(pin)) return null;
+    if (pin === MANAGER_PIN) return "Raz";
+    const crypto = require("crypto");
+    const h = crypto.createHash("sha256").update(pin + "razco-salt-2026").digest("hex");
+    const r = await pool.query("SELECT name FROM employees WHERE role='manager' AND active=TRUE AND pin_hash=$1 AND (store=$2 OR store IS NULL) LIMIT 1", [h, store || DEFAULT_STORE]);
+    return r.rows.length ? r.rows[0].name : null;
+  }
+  function leadThrottled(ip) {
+    const now = Date.now(); const a = (leadFails[ip] || []).filter(t => now - t < 10 * 60 * 1000);
+    leadFails[ip] = a; return a.length >= 8;
+  }
+  app.post("/api/lead/verify", wrap(async (req, res) => {
+    const ip = String(req.headers["x-forwarded-for"] || req.ip || "").split(",")[0].trim();
+    if (leadThrottled(ip)) return res.status(429).json({ ok:false, error:"too_many", message:"Too many wrong PINs — wait 10 minutes" });
+    const name = await verifyLead(req.body && req.body.pin, req.body && req.body.store);
+    if (!name) { (leadFails[ip] = leadFails[ip] || []).push(Date.now()); return res.status(403).json({ ok:false, error:"wrong_pin", message:"Wrong lead PIN" }); }
+    res.json({ ok:true, name });
+  }));
+
   app.post("/api/tpr/decision", wrap(async (req, res) => {
-    const { store = DEFAULT_STORE, upc = "", description, decision, nearExpiry = false, overstock = false, reason = "", newEndDate = null, clerkName } = req.body || {};
+    const { store = DEFAULT_STORE, upc = "", description, decision, nearExpiry = false, overstock = false, reason = "", newEndDate = null, clerkName, leadPin } = req.body || {};
     if (!description || !["continue", "end"].includes(decision)) return res.status(400).json({ error:"description and decision (continue|end) required" });
+    let leadName = null;
+    if (decision === "continue") {
+      const ip = String(req.headers["x-forwarded-for"] || req.ip || "").split(",")[0].trim();
+      if (leadThrottled(ip)) return res.status(429).json({ error:"too_many", message:"Too many wrong PINs — wait 10 minutes" });
+      leadName = await verifyLead(leadPin, store);
+      if (!leadName) { (leadFails[ip] = leadFails[ip] || []).push(Date.now()); return res.status(403).json({ error:"lead_required", message:"The store lead must enter their PIN to continue a TPR" }); }
+    }
     const date = ptParts().date;
     const key = (upc || description).toString().trim().toLowerCase().slice(0, 120);
     const r = await pool.query(
-      `INSERT INTO tpr_decisions (store,run_date,item_key,upc,description,decision,near_expiry,overstock,reason,new_end_date,clerk_name)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+      `INSERT INTO tpr_decisions (store,run_date,item_key,upc,description,decision,near_expiry,overstock,reason,new_end_date,clerk_name,lead_name)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
        ON CONFLICT (store,run_date,item_key) DO UPDATE SET
          decision=EXCLUDED.decision, near_expiry=EXCLUDED.near_expiry, overstock=EXCLUDED.overstock,
-         reason=EXCLUDED.reason, new_end_date=EXCLUDED.new_end_date, clerk_name=EXCLUDED.clerk_name, created_at=NOW()
+         reason=EXCLUDED.reason, new_end_date=EXCLUDED.new_end_date, clerk_name=EXCLUDED.clerk_name, lead_name=EXCLUDED.lead_name, created_at=NOW()
        RETURNING id`,
-      [store, date, key, upc, description, decision, !!nearExpiry, !!overstock, String(reason).slice(0, 300), newEndDate || null, clerkName || null]
+      [store, date, key, upc, description, decision, !!nearExpiry, !!overstock, String(reason).slice(0, 300), newEndDate || null, clerkName || null, leadName]
     );
     if (decision === "continue") {
-      notifyRaz(`🏷️ <b>TPR continued</b> by ${esc(clerkName || "clerk")}: ${esc(description)}\nWhy: ${nearExpiry ? "near-expiry stock" : ""}${nearExpiry && overstock ? " + " : ""}${overstock ? "excess inventory" : ""}${reason ? " — " + esc(reason) : ""}\nNew end date: ${esc(newEndDate || "not set")}`).catch(() => {});
+      notifyRaz(`🏷️ <b>TPR continued</b> by ${esc(clerkName || "clerk")} — confirmed by lead <b>${esc(leadName)}</b>\n${esc(description)}\nWhy: ${esc(reason || (nearExpiry ? "near-expiry stock" : overstock ? "excess inventory" : "—"))}\nNew end date: ${esc(newEndDate || "not set")}`).catch(() => {});
     }
     res.json({ ok:true, id:r.rows[0].id });
   }));
@@ -588,6 +635,28 @@ module.exports = function raziModules(app, pool) {
     if (cancelled) await pool.query("UPDATE manager_tasks SET status='cancelled' WHERE id=$1", [req.params.id]);
     else if (done === true) await pool.query("UPDATE manager_tasks SET status='done', done_by=$2, done_at=NOW(), note=$3 WHERE id=$1", [req.params.id, clerkName || null, String(note).slice(0, 300)]);
     else if (done === false) await pool.query("UPDATE manager_tasks SET status='open', done_by=NULL, done_at=NULL WHERE id=$1", [req.params.id]);
+    res.json({ ok:true });
+  }));
+
+  // ── AISLE TPR (every other week, aisle by aisle) ─────────────
+  app.get("/api/aisle-tpr", wrap(async (req, res) => {
+    const store = req.query.store || DEFAULT_STORE;
+    const week = String(req.query.week || "");
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(week)) return res.status(400).json({ error:"week (YYYY-MM-DD) required" });
+    const r = await pool.query("SELECT zone_code, items, discount, in_brdata, clerk_name, note, created_at FROM aisle_tpr WHERE store=$1 AND week_start=$2", [store, week]);
+    res.json({ week, rows: r.rows.map(x => ({ zone:x.zone_code, items:x.items, discount:Number(x.discount), inBrdata:x.in_brdata, clerk:x.clerk_name, note:x.note, at:x.created_at })) });
+  }));
+  app.post("/api/aisle-tpr", wrap(async (req, res) => {
+    const { store = DEFAULT_STORE, week, zone, items, discount, inBrdata, clerkName, note = "" } = req.body || {};
+    const n = parseInt(items, 10), d = Number(discount);
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(String(week || "")) || !zone) return res.status(400).json({ error:"week and zone required" });
+    if (!(n >= 40 && n <= 50)) return res.status(400).json({ error:"items_range", message:"Put 40 to 50 items on TPR in each aisle" });
+    if (!(d >= 0.5 && d <= 0.75)) return res.status(400).json({ error:"discount_range", message:"The discount must be 50¢ to 75¢" });
+    if (!inBrdata) return res.status(400).json({ error:"brdata_required", message:"Enter the TPR batch in BRdata first" });
+    await pool.query(
+      `INSERT INTO aisle_tpr (store,week_start,zone_code,items,discount,in_brdata,clerk_name,note) VALUES ($1,$2,$3,$4,$5,TRUE,$6,$7)
+       ON CONFLICT (store,week_start,zone_code) DO UPDATE SET items=EXCLUDED.items, discount=EXCLUDED.discount, in_brdata=TRUE, clerk_name=EXCLUDED.clerk_name, note=EXCLUDED.note, created_at=NOW()`,
+      [store, week, String(zone), n, d, clerkName || null, String(note).slice(0, 200)]);
     res.json({ ok:true });
   }));
 
@@ -717,7 +786,7 @@ module.exports = function raziModules(app, pool) {
       L.push(`Expired tags out: ${doneZones.filter(z => z.expiredOut === true).length} yes / ${noExp.length} no`);
       L.push(`Missing tags tagged: ${doneZones.filter(z => z.missingDone === true).length} yes / ${noMis.length} no`);
       const rz = walkZones.filter(z => z.randomRequired);
-      L.push(`Random TPR check (${rz.map(z => esc(z.code)).join(", ")}): ${rz.filter(z => z.randomTpr === true).length}/${rz.length} done`);
+      if (rz.length) L.push(`Random TPR check (${rz.map(z => esc(z.code)).join(", ")}): ${rz.filter(z => z.randomTpr === true).length}/${rz.length} done`);
       [...noExp, ...noMis, ...noTpr].filter((z, i, a) => a.indexOf(z) === i).forEach(z => L.push(`  ⚠️ ${esc(z.name)}: ${esc(z.notes || "no note")}`));
       doneZones.filter(z => z.method === "manager_override").forEach(z => L.push(`  🔑 ${esc(z.name)}: manager override — ${esc(z.notes || "")}`));
       L.push("");
