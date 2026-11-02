@@ -556,6 +556,82 @@ module.exports = function raziModules(app, pool) {
     res.json({ decisions:r.rows });
   }));
 
+  // ── TPRs ENDING (from the shelf system's BRdata deal feed) ───
+  // The shelf API loads C:\brdata\cloudexp\FUTPRICEbatch*.csv every morning.
+  // We ask it which deals end today / tomorrow so the clerk can decide in bulk.
+  app.get("/api/tpr/ending", wrap(async (req, res) => {
+    const days = Math.min(Math.max(parseInt(req.query.days || "1", 10) || 1, 0), 7);
+    const base = (process.env.SHELF_API_URL || "https://razi-shelf-api-production.up.railway.app").replace(/\/+$/, "");
+    const code = String(req.query.shelfStore || process.env.SHELF_STORE_CODE || "lindsay");
+    const headers = { Accept: "application/json" };
+    if (process.env.SHELF_API_TOKEN) headers["X-Shelf-Token"] = process.env.SHELF_API_TOKEN;
+    if (typeof fetch !== "function") return res.status(502).json({ error:"no_fetch", message:"Server cannot call the shelf system" });
+    let j;
+    try {
+      const ctl = new AbortController(); const t = setTimeout(() => ctl.abort(), 15000);
+      const r = await fetch(`${base}/api/shelf/v1/s/${encodeURIComponent(code)}/expiring?days=${days}`, { headers, signal: ctl.signal });
+      clearTimeout(t);
+      if (!r.ok) return res.status(502).json({ error:"shelf_" + r.status, message:`Shelf system answered ${r.status}` });
+      j = await r.json();
+    } catch (e) { return res.status(502).json({ error:"shelf_unreachable", message:"Can't reach the shelf system" }); }
+    const today = ptParts().date;
+    const items = (j.expiring || []).filter(x => x.ends >= today).map(x => ({
+      upc: String(x.upc || ""), description: x.description || x.upc, size: x.size || "",
+      type: x.deal_type, starts: x.starts, ends: x.ends,
+      salePrice: x.sale_price, qty: x.qty || 1, unitPrice: x.unit_price,
+      retail: x.retail, zone: x.zone_code, aisle: x.aisle
+    }));
+    res.json({ today, days, count: items.length, items });
+  }));
+
+  // Bulk decision: many items at once, one lead PIN, one Telegram message.
+  app.post("/api/tpr/decision/bulk", wrap(async (req, res) => {
+    const { store = DEFAULT_STORE, items, decision, reasons = [], note = "", newEndDate = null, clerkName, leadPin } = req.body || {};
+    if (!Array.isArray(items) || !items.length || !["continue", "end"].includes(decision)) return res.status(400).json({ error:"items[] and decision (continue|end) required" });
+    if (items.length > 500) return res.status(400).json({ error:"too_many", message:"Max 500 items at a time" });
+    let leadName = null;
+    if (decision === "continue") {
+      if (!newEndDate || !/^\d{4}-\d{2}-\d{2}$/.test(String(newEndDate))) return res.status(400).json({ error:"end_date", message:"Pick the new TPR end date" });
+      if (!Array.isArray(reasons) || !reasons.length) return res.status(400).json({ error:"reason", message:"Tick at least one reason" });
+      const ip = String(req.headers["x-forwarded-for"] || req.ip || "").split(",")[0].trim();
+      if (leadThrottled(ip)) return res.status(429).json({ error:"too_many", message:"Too many wrong PINs — wait 10 minutes" });
+      leadName = await verifyLead(leadPin, store);
+      if (!leadName) { (leadFails[ip] = leadFails[ip] || []).push(Date.now()); return res.status(403).json({ error:"lead_required", message:"The store lead must enter their PIN to continue TPRs" }); }
+    }
+    const date = ptParts().date;
+    const rs = (Array.isArray(reasons) ? reasons : []).map(x => String(x).slice(0, 40));
+    const reason = [rs.length ? "Why: " + rs.join(", ") : "", String(note || "").slice(0, 200)].filter(Boolean).join(" — ").slice(0, 300);
+    const nearExp = rs.some(x => /near expiry|short life/i.test(x)), over = rs.some(x => /inventory/i.test(x));
+    let n = 0; const ids = [];
+    for (const it of items) {
+      const description = String(it.description || it.upc || "").slice(0, 200);
+      if (!description) continue;
+      const upc = String(it.upc || "").slice(0, 30);
+      const key = (upc || description).toLowerCase().slice(0, 120);
+      const r = await pool.query(
+        `INSERT INTO tpr_decisions (store,run_date,item_key,upc,description,decision,near_expiry,overstock,reason,new_end_date,clerk_name,lead_name)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+         ON CONFLICT (store,run_date,item_key) DO UPDATE SET
+           decision=EXCLUDED.decision, near_expiry=EXCLUDED.near_expiry, overstock=EXCLUDED.overstock,
+           reason=EXCLUDED.reason, new_end_date=EXCLUDED.new_end_date, clerk_name=EXCLUDED.clerk_name, lead_name=EXCLUDED.lead_name, created_at=NOW()
+         RETURNING id`,
+        [store, date, key, upc, description, decision, nearExp, over, reason, decision === "continue" ? newEndDate : null, clerkName || null, leadName]);
+      ids.push(r.rows[0].id); n++;
+    }
+    if (decision === "continue") {
+      const names = items.slice(0, 12).map(i => "• " + esc(String(i.description || i.upc || "").slice(0, 40))).join("\n");
+      notifyRaz(`🏷️ <b>${n} TPR${n === 1 ? "" : "s"} continued</b> by ${esc(clerkName || "clerk")} — confirmed by lead <b>${esc(leadName)}</b>\nNew end date: ${esc(newEndDate)}\n${esc(reason)}\n${names}${n > 12 ? `\n…and ${n - 12} more` : ""}`).catch(() => {});
+    }
+    res.json({ ok:true, saved:n, ids });
+  }));
+
+  // One tap: "I extended all the continued TPRs in BRdata".
+  app.post("/api/tpr/decision/extended", wrap(async (req, res) => {
+    const { store = DEFAULT_STORE, extendedInBrdata = true } = req.body || {};
+    const r = await pool.query("UPDATE tpr_decisions SET extended_in_brdata=$3 WHERE store=$1 AND run_date=$2 AND decision='continue'", [store, ptParts().date, !!extendedInBrdata]);
+    res.json({ ok:true, updated:r.rowCount });
+  }));
+
   // ── VERIFY (weekly-ad / sale items held from markdown) ──────
   app.post("/api/verify/register", wrap(async (req, res) => {
     const { store = DEFAULT_STORE, items } = req.body || {};
