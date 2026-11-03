@@ -254,6 +254,17 @@ module.exports = function raziModules(app, pool) {
           created_at  TIMESTAMPTZ DEFAULT NOW(),
           PRIMARY KEY (store, week_start, zone_code)
         );
+        CREATE TABLE IF NOT EXISTS aisle_tpr_assign (
+          id          SERIAL PRIMARY KEY,
+          store       TEXT NOT NULL,
+          run_date    DATE NOT NULL,
+          clerk_name  TEXT NOT NULL,
+          zones       JSONB NOT NULL DEFAULT '[]',
+          assigned_by TEXT,
+          cancelled   BOOLEAN DEFAULT FALSE,
+          created_at  TIMESTAMPTZ DEFAULT NOW()
+        );
+        CREATE INDEX IF NOT EXISTS idx_atassign ON aisle_tpr_assign(store, run_date);
         CREATE TABLE IF NOT EXISTS brdata_exports (
           store       TEXT NOT NULL,
           export_date DATE NOT NULL,
@@ -365,7 +376,9 @@ module.exports = function raziModules(app, pool) {
     // Every job before "Finish shift" must be done — no skipping
     const runRow = (await pool.query("SELECT steps_complete FROM day_runs WHERE store=$1 AND run_date=$2", [store, date])).rows[0];
     const doneSteps = (runRow && runRow.steps_complete) || [];
-    const missing = STEP_LABELS.slice(0, STEP_LABELS.length - 1).filter((l, i) => !doneSteps.includes(i));
+    // Aisle TPR (job 2) only counts when Raz assigned it to this clerk today
+    const asg = (await pool.query("SELECT 1 FROM aisle_tpr_assign WHERE store=$1 AND run_date=$2 AND cancelled=FALSE AND LOWER(clerk_name)=LOWER($3) LIMIT 1", [store, date, clerkName])).rows.length > 0;
+    const missing = STEP_LABELS.slice(0, STEP_LABELS.length - 1).filter((l, i) => !doneSteps.includes(i) && !(i === 1 && !asg));
     if (missing.length) return res.status(409).json({ error:"steps_incomplete", message:`Not finished: ${missing.join(", ")}`, missing });
     await pool.query(
       `INSERT INTO day_runs (store,run_date,confirmed_at,confirmed_by,confirm_note,incomplete,updated_by,updated_at)
@@ -733,6 +746,35 @@ module.exports = function raziModules(app, pool) {
       `INSERT INTO aisle_tpr (store,week_start,zone_code,items,discount,in_brdata,clerk_name,note) VALUES ($1,$2,$3,$4,$5,TRUE,$6,$7)
        ON CONFLICT (store,week_start,zone_code) DO UPDATE SET items=EXCLUDED.items, discount=EXCLUDED.discount, in_brdata=TRUE, clerk_name=EXCLUDED.clerk_name, note=EXCLUDED.note, created_at=NOW()`,
       [store, week, String(zone), n, d, clerkName || null, String(note).slice(0, 200)]);
+    res.json({ ok:true });
+  }));
+
+  // ── AISLE TPR ASSIGNMENT (Raz picks clerk + aisle(s) + day) ──
+  const okDate = d => /^\d{4}-\d{2}-\d{2}$/.test(String(d || ""));
+  app.post("/api/aisle-tpr/assign", wrap(async (req, res) => {
+    const { store = DEFAULT_STORE, date, clerkName, zones, assignedBy = "Raz" } = req.body || {};
+    if (!okDate(date) || !clerkName || !Array.isArray(zones) || !zones.length) return res.status(400).json({ error:"bad_request", message:"Pick a clerk, a day and at least one aisle" });
+    const z = (await pool.query("SELECT code FROM aisle_zones WHERE store=$1 AND kind='aisle'", [store])).rows.map(x => x.code);
+    const clean = [...new Set(zones.map(String))].filter(c => z.includes(c));
+    if (!clean.length) return res.status(400).json({ error:"bad_zones", message:"Unknown aisle" });
+    await pool.query("UPDATE aisle_tpr_assign SET cancelled=TRUE WHERE store=$1 AND run_date=$2 AND LOWER(clerk_name)=LOWER($3)", [store, date, clerkName]);
+    const r = await pool.query("INSERT INTO aisle_tpr_assign (store,run_date,clerk_name,zones,assigned_by) VALUES ($1,$2,$3,$4,$5) RETURNING id", [store, date, String(clerkName).slice(0, 60), JSON.stringify(clean), String(assignedBy).slice(0, 40)]);
+    res.json({ ok:true, id:r.rows[0].id, zones:clean });
+  }));
+  app.get("/api/aisle-tpr/assignment", wrap(async (req, res) => {
+    const store = req.query.store || DEFAULT_STORE;
+    const date = okDate(req.query.date) ? req.query.date : ptParts().date;
+    const r = await pool.query("SELECT id, zones FROM aisle_tpr_assign WHERE store=$1 AND run_date=$2 AND cancelled=FALSE AND LOWER(clerk_name)=LOWER($3) ORDER BY id DESC LIMIT 1", [store, date, req.query.clerkName || ""]);
+    res.json({ date, assigned: r.rows.length > 0, id: r.rows[0] ? r.rows[0].id : null, zones: r.rows[0] ? r.rows[0].zones : [] });
+  }));
+  app.get("/api/aisle-tpr/assignments", wrap(async (req, res) => {
+    const store = req.query.store || DEFAULT_STORE;
+    const from = ptParts().date;
+    const r = await pool.query("SELECT id, run_date::text AS date, clerk_name, zones FROM aisle_tpr_assign WHERE store=$1 AND cancelled=FALSE AND run_date >= $2::date ORDER BY run_date, id", [store, from]);
+    res.json({ rows: r.rows.map(x => ({ id:x.id, date:x.date, clerk:x.clerk_name, zones:x.zones })) });
+  }));
+  app.delete("/api/aisle-tpr/assign/:id", wrap(async (req, res) => {
+    await pool.query("UPDATE aisle_tpr_assign SET cancelled=TRUE WHERE id=$1", [parseInt(req.params.id, 10) || 0]);
     res.json({ ok:true });
   }));
 
