@@ -242,6 +242,7 @@ module.exports = function raziModules(app, pool) {
         CREATE INDEX IF NOT EXISTS idx_verify_store ON verify_tasks(store, status);
 
         ALTER TABLE tpr_decisions ADD COLUMN IF NOT EXISTS lead_name TEXT;
+        ALTER TABLE tpr_decisions ADD COLUMN IF NOT EXISTS snap JSONB;
         CREATE TABLE IF NOT EXISTS aisle_tpr (
           store       TEXT NOT NULL,
           week_start  DATE NOT NULL,
@@ -604,6 +605,23 @@ module.exports = function raziModules(app, pool) {
       salePrice: x.sale_price, qty: x.qty || 1, unitPrice: x.unit_price,
       retail: x.retail, zone: x.zone_code, aisle: x.aisle
     }));
+    // Items the clerk marked "not today" come back until they are decided
+    try {
+      const st0 = String(req.query.store || DEFAULT_STORE);
+      const have = new Set(items.map(i => (i.upc || i.description || "").toLowerCase().slice(0, 120)));
+      const car = await pool.query(
+        `SELECT d.item_key, d.upc, d.description, d.snap FROM tpr_decisions d
+          WHERE d.store=$1 AND d.decision='later' AND d.run_date < $2::date AND d.run_date >= ($2::date - 4)
+            AND NOT EXISTS (SELECT 1 FROM tpr_decisions n WHERE n.store=d.store AND n.item_key=d.item_key AND n.run_date > d.run_date)
+          ORDER BY d.created_at`, [st0, today]);
+      car.rows.forEach(r => {
+        if (have.has(r.item_key)) return;
+        const sn = r.snap || {};
+        items.push({ upc: r.upc || "", description: r.description, size: "", type: sn.type || "TPR", starts: null, ends: sn.ends || today,
+          salePrice: sn.salePrice == null ? null : sn.salePrice, qty: sn.qty || 1, unitPrice: null, retail: sn.retail == null ? null : sn.retail,
+          zone: sn.aisle || "", aisle: sn.aisle || "", carried: true });
+      });
+    } catch (e) {}
     // Fill missing aisles from the list the team has built (item_aisles)
     try {
       const st = String(req.query.store || DEFAULT_STORE);
@@ -639,7 +657,7 @@ module.exports = function raziModules(app, pool) {
   // Bulk decision: many items at once, one lead PIN, one Telegram message.
   app.post("/api/tpr/decision/bulk", wrap(async (req, res) => {
     const { store = DEFAULT_STORE, items, decision, reasons = [], note = "", newEndDate = null, clerkName, leadPin } = req.body || {};
-    if (!Array.isArray(items) || !items.length || !["continue", "end", "brdata"].includes(decision)) return res.status(400).json({ error:"items[] and decision (continue|end) required" });
+    if (!Array.isArray(items) || !items.length || !["continue", "end", "brdata", "later"].includes(decision)) return res.status(400).json({ error:"items[] and decision (continue|end) required" });
     if (items.length > 500) return res.status(400).json({ error:"too_many", message:"Max 500 items at a time" });
     let leadName = null;
     if (decision === "continue") {
@@ -660,18 +678,18 @@ module.exports = function raziModules(app, pool) {
       const upc = String(it.upc || "").slice(0, 30);
       const key = (upc || description).toLowerCase().slice(0, 120);
       const rs = (Array.isArray(it.reasons) && it.reasons.length ? it.reasons : topRs).map(x => String(x).slice(0, 40));
-      const reason = decision === "brdata" ? "Already processed in BRdata"
+      const reason = decision === "later" ? "Not today — carried to tomorrow" : decision === "brdata" ? "Already processed in BRdata"
         : [decision === "continue" && rs.length ? "Why: " + rs.join(", ") : "", String(note || "").slice(0, 200)].filter(Boolean).join(" — ").slice(0, 300);
       const nearExp = decision === "continue" && rs.some(x => /near expiry|short life/i.test(x)), over = decision === "continue" && rs.some(x => /inventory/i.test(x));
       lines.push("• " + esc(description.slice(0, 40)) + (decision === "continue" && rs.length ? " — " + esc(rs.join(", ")) : ""));
       const r = await pool.query(
-        `INSERT INTO tpr_decisions (store,run_date,item_key,upc,description,decision,near_expiry,overstock,reason,new_end_date,clerk_name,lead_name)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
-         ON CONFLICT (store,run_date,item_key) DO UPDATE SET
+        `INSERT INTO tpr_decisions (store,run_date,item_key,upc,description,decision,near_expiry,overstock,reason,new_end_date,clerk_name,lead_name,snap)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+         ON CONFLICT (store,run_date,item_key) DO UPDATE SET snap=EXCLUDED.snap,
            decision=EXCLUDED.decision, near_expiry=EXCLUDED.near_expiry, overstock=EXCLUDED.overstock,
            reason=EXCLUDED.reason, new_end_date=EXCLUDED.new_end_date, clerk_name=EXCLUDED.clerk_name, lead_name=EXCLUDED.lead_name, created_at=NOW()
          RETURNING id`,
-        [store, date, key, upc, description, decision, nearExp, over, reason, decision === "continue" ? newEndDate : null, clerkName || null, leadName]);
+        [store, date, key, upc, description, decision, nearExp, over, reason, decision === "continue" ? newEndDate : null, clerkName || null, leadName, decision === "later" && it.snap ? JSON.stringify(it.snap) : null]);
       ids.push(r.rows[0].id); n++;
     }
     if (decision === "continue") {
@@ -911,7 +929,7 @@ module.exports = function raziModules(app, pool) {
         note: run ? run.confirm_note : null, incomplete: run ? run.incomplete : [],
       },
       walk: { total: zones.length, done: doneZones.length, zones: walkZones, randomZones: rnd },
-      tpr: { continued: tprs.filter(t => t.decision === "continue"), ended: tprs.filter(t => t.decision === "end"), processed: tprs.filter(t => t.decision === "brdata") },
+      tpr: { continued: tprs.filter(t => t.decision === "continue"), ended: tprs.filter(t => t.decision === "end"), processed: tprs.filter(t => t.decision === "brdata"), later: tprs.filter(t => t.decision === "later") },
       batches: { done: batches.filter(b => b.done).length, total: batches.length, errors: batches.filter(b => b.error).length },
       expiry: {
         pulled: expiry.filter(e => e.status === "pulled").length,
@@ -951,7 +969,7 @@ module.exports = function raziModules(app, pool) {
       doneZones.filter(z => z.method === "manager_override").forEach(z => L.push(`  🔑 ${esc(z.name)}: manager override — ${esc(z.notes || "")}`));
       L.push("");
     }
-    L.push(`🏷️ <b>TPR check:</b> ${data.tpr.continued.length} continued, ${data.tpr.ended.length} let end, ${data.tpr.processed.length} already done in BRdata`);
+    L.push(`🏷️ <b>TPR check:</b> ${data.tpr.continued.length} continued, ${data.tpr.ended.length} let end, ${data.tpr.processed.length} already done in BRdata, ${data.tpr.later.length} carried to tomorrow`);
     data.tpr.continued.forEach(t => L.push(`  • ${esc(t.description)} → ${esc(t.end_date || "no date")}${t.extended_in_brdata ? "" : " (not yet extended in BRdata)"}`));
     L.push(`🖥️ <b>Batches:</b> ${data.batches.done}/${data.batches.total} processed${data.batches.errors ? `, ${data.batches.errors} error(s)` : ""}`);
     L.push(`📦 <b>Expiry:</b> ${data.expiry.pulled} pulled, ${data.expiry.decided} decided, ${data.expiry.open} still open`);
