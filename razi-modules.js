@@ -265,6 +265,16 @@ module.exports = function raziModules(app, pool) {
           created_at  TIMESTAMPTZ DEFAULT NOW()
         );
         CREATE INDEX IF NOT EXISTS idx_atassign ON aisle_tpr_assign(store, run_date);
+        CREATE TABLE IF NOT EXISTS item_aisles (
+          store       TEXT NOT NULL,
+          item_key    TEXT NOT NULL,
+          upc         TEXT,
+          description TEXT,
+          zone_code   TEXT NOT NULL,
+          set_by      TEXT,
+          set_at      TIMESTAMPTZ DEFAULT NOW(),
+          PRIMARY KEY (store, item_key)
+        );
         CREATE TABLE IF NOT EXISTS brdata_exports (
           store       TEXT NOT NULL,
           export_date DATE NOT NULL,
@@ -594,33 +604,66 @@ module.exports = function raziModules(app, pool) {
       salePrice: x.sale_price, qty: x.qty || 1, unitPrice: x.unit_price,
       retail: x.retail, zone: x.zone_code, aisle: x.aisle
     }));
+    // Fill missing aisles from the list the team has built (item_aisles)
+    try {
+      const st = String(req.query.store || DEFAULT_STORE);
+      const m = {};
+      (await pool.query("SELECT item_key, zone_code FROM item_aisles WHERE store=$1", [st])).rows.forEach(r => { m[r.item_key] = r.zone_code; });
+      items.forEach(i => { if (!i.zone && !i.aisle) { const z = m[(i.upc || i.description || "").toLowerCase().slice(0, 120)]; if (z) i.zone = z; } });
+    } catch (e) {}
     res.json({ today, days, count: items.length, items });
+  }));
+
+  // ── ITEM AISLES: the team assigns an aisle to items that have none ──
+  app.post("/api/item-aisle", wrap(async (req, res) => {
+    const { store = DEFAULT_STORE, upc = "", description = "", zone, clerkName } = req.body || {};
+    const key = String(upc || description || "").toLowerCase().slice(0, 120);
+    if (!key || !zone) return res.status(400).json({ error:"bad_request", message:"Item and aisle required" });
+    const z = (await pool.query("SELECT 1 FROM aisle_zones WHERE store=$1 AND code=$2", [store, String(zone)])).rows.length;
+    if (!z) return res.status(400).json({ error:"bad_zone", message:"Unknown aisle" });
+    await pool.query(
+      `INSERT INTO item_aisles (store,item_key,upc,description,zone_code,set_by) VALUES ($1,$2,$3,$4,$5,$6)
+       ON CONFLICT (store,item_key) DO UPDATE SET zone_code=EXCLUDED.zone_code, description=EXCLUDED.description, set_by=EXCLUDED.set_by, set_at=NOW()`,
+      [store, key, String(upc).slice(0, 30), String(description).slice(0, 200), String(zone), clerkName || null]);
+    res.json({ ok:true });
+  }));
+  app.get("/api/item-aisle", wrap(async (req, res) => {
+    const store = req.query.store || DEFAULT_STORE;
+    const r = await pool.query("SELECT upc, description, zone_code, set_by, set_at FROM item_aisles WHERE store=$1 ORDER BY set_at", [store]);
+    if (String(req.query.format) === "csv") {
+      const q = v => '"' + String(v == null ? "" : v).replace(/"/g, '""') + '"';
+      res.type("text/csv").send("upc,description,aisle,set_by,set_at\n" + r.rows.map(x => [x.upc, x.description, x.zone_code, x.set_by, x.set_at && x.set_at.toISOString()].map(q).join(",")).join("\n"));
+    } else res.json({ count: r.rows.length, rows: r.rows });
   }));
 
   // Bulk decision: many items at once, one lead PIN, one Telegram message.
   app.post("/api/tpr/decision/bulk", wrap(async (req, res) => {
     const { store = DEFAULT_STORE, items, decision, reasons = [], note = "", newEndDate = null, clerkName, leadPin } = req.body || {};
-    if (!Array.isArray(items) || !items.length || !["continue", "end"].includes(decision)) return res.status(400).json({ error:"items[] and decision (continue|end) required" });
+    if (!Array.isArray(items) || !items.length || !["continue", "end", "brdata"].includes(decision)) return res.status(400).json({ error:"items[] and decision (continue|end) required" });
     if (items.length > 500) return res.status(400).json({ error:"too_many", message:"Max 500 items at a time" });
     let leadName = null;
     if (decision === "continue") {
       if (!newEndDate || !/^\d{4}-\d{2}-\d{2}$/.test(String(newEndDate))) return res.status(400).json({ error:"end_date", message:"Pick the new TPR end date" });
-      if (!Array.isArray(reasons) || !reasons.length) return res.status(400).json({ error:"reason", message:"Tick at least one reason" });
+      const everyHasWhy = items.every(it => (Array.isArray(it.reasons) && it.reasons.length) || (Array.isArray(reasons) && reasons.length));
+      if (!everyHasWhy) return res.status(400).json({ error:"reason", message:"Every continued item needs a reason" });
       const ip = String(req.headers["x-forwarded-for"] || req.ip || "").split(",")[0].trim();
       if (leadThrottled(ip)) return res.status(429).json({ error:"too_many", message:"Too many wrong PINs — wait 10 minutes" });
       leadName = await verifyLead(leadPin, store);
       if (!leadName) { (leadFails[ip] = leadFails[ip] || []).push(Date.now()); return res.status(403).json({ error:"lead_required", message:"The store lead must enter their PIN to continue TPRs" }); }
     }
     const date = ptParts().date;
-    const rs = (Array.isArray(reasons) ? reasons : []).map(x => String(x).slice(0, 40));
-    const reason = [rs.length ? "Why: " + rs.join(", ") : "", String(note || "").slice(0, 200)].filter(Boolean).join(" — ").slice(0, 300);
-    const nearExp = rs.some(x => /near expiry|short life/i.test(x)), over = rs.some(x => /inventory/i.test(x));
-    let n = 0; const ids = [];
+    const topRs = (Array.isArray(reasons) ? reasons : []).map(x => String(x).slice(0, 40));
+    let n = 0; const ids = []; const lines = [];
     for (const it of items) {
       const description = String(it.description || it.upc || "").slice(0, 200);
       if (!description) continue;
       const upc = String(it.upc || "").slice(0, 30);
       const key = (upc || description).toLowerCase().slice(0, 120);
+      const rs = (Array.isArray(it.reasons) && it.reasons.length ? it.reasons : topRs).map(x => String(x).slice(0, 40));
+      const reason = decision === "brdata" ? "Already processed in BRdata"
+        : [decision === "continue" && rs.length ? "Why: " + rs.join(", ") : "", String(note || "").slice(0, 200)].filter(Boolean).join(" — ").slice(0, 300);
+      const nearExp = decision === "continue" && rs.some(x => /near expiry|short life/i.test(x)), over = decision === "continue" && rs.some(x => /inventory/i.test(x));
+      lines.push("• " + esc(description.slice(0, 40)) + (decision === "continue" && rs.length ? " — " + esc(rs.join(", ")) : ""));
       const r = await pool.query(
         `INSERT INTO tpr_decisions (store,run_date,item_key,upc,description,decision,near_expiry,overstock,reason,new_end_date,clerk_name,lead_name)
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
@@ -632,8 +675,7 @@ module.exports = function raziModules(app, pool) {
       ids.push(r.rows[0].id); n++;
     }
     if (decision === "continue") {
-      const names = items.slice(0, 12).map(i => "• " + esc(String(i.description || i.upc || "").slice(0, 40))).join("\n");
-      notifyRaz(`🏷️ <b>${n} TPR${n === 1 ? "" : "s"} continued</b> by ${esc(clerkName || "clerk")} — confirmed by lead <b>${esc(leadName)}</b>\nNew end date: ${esc(newEndDate)}\n${esc(reason)}\n${names}${n > 12 ? `\n…and ${n - 12} more` : ""}`).catch(() => {});
+      notifyRaz(`🏷️ <b>${n} TPR${n === 1 ? "" : "s"} continued</b> by ${esc(clerkName || "clerk")} — confirmed by lead <b>${esc(leadName)}</b>\nNew end date: ${esc(newEndDate)}${note ? "\n" + esc(String(note).slice(0, 200)) : ""}\n${lines.slice(0, 12).join("\n")}${n > 12 ? `\n…and ${n - 12} more` : ""}`).catch(() => {});
     }
     res.json({ ok:true, saved:n, ids });
   }));
@@ -869,7 +911,7 @@ module.exports = function raziModules(app, pool) {
         note: run ? run.confirm_note : null, incomplete: run ? run.incomplete : [],
       },
       walk: { total: zones.length, done: doneZones.length, zones: walkZones, randomZones: rnd },
-      tpr: { continued: tprs.filter(t => t.decision === "continue"), ended: tprs.filter(t => t.decision === "end") },
+      tpr: { continued: tprs.filter(t => t.decision === "continue"), ended: tprs.filter(t => t.decision === "end"), processed: tprs.filter(t => t.decision === "brdata") },
       batches: { done: batches.filter(b => b.done).length, total: batches.length, errors: batches.filter(b => b.error).length },
       expiry: {
         pulled: expiry.filter(e => e.status === "pulled").length,
@@ -909,7 +951,7 @@ module.exports = function raziModules(app, pool) {
       doneZones.filter(z => z.method === "manager_override").forEach(z => L.push(`  🔑 ${esc(z.name)}: manager override — ${esc(z.notes || "")}`));
       L.push("");
     }
-    L.push(`🏷️ <b>TPR check:</b> ${data.tpr.continued.length} continued, ${data.tpr.ended.length} let end`);
+    L.push(`🏷️ <b>TPR check:</b> ${data.tpr.continued.length} continued, ${data.tpr.ended.length} let end, ${data.tpr.processed.length} already done in BRdata`);
     data.tpr.continued.forEach(t => L.push(`  • ${esc(t.description)} → ${esc(t.end_date || "no date")}${t.extended_in_brdata ? "" : " (not yet extended in BRdata)"}`));
     L.push(`🖥️ <b>Batches:</b> ${data.batches.done}/${data.batches.total} processed${data.batches.errors ? `, ${data.batches.errors} error(s)` : ""}`);
     L.push(`📦 <b>Expiry:</b> ${data.expiry.pulled} pulled, ${data.expiry.decided} decided, ${data.expiry.open} still open`);
