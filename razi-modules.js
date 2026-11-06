@@ -266,6 +266,31 @@ module.exports = function raziModules(app, pool) {
           created_at  TIMESTAMPTZ DEFAULT NOW()
         );
         CREATE INDEX IF NOT EXISTS idx_atassign ON aisle_tpr_assign(store, run_date);
+        CREATE TABLE IF NOT EXISTS tpr_seen (
+          store       TEXT NOT NULL,
+          item_key    TEXT NOT NULL,
+          upc         TEXT,
+          description TEXT,
+          deal_type   TEXT,
+          starts      DATE,
+          ends        DATE NOT NULL,
+          sale_price  NUMERIC(10,2),
+          retail      NUMERIC(10,2),
+          qty         INT,
+          zone        TEXT,
+          first_seen  TIMESTAMPTZ DEFAULT NOW(),
+          last_seen   TIMESTAMPTZ DEFAULT NOW(),
+          PRIMARY KEY (store, item_key, ends)
+        );
+        CREATE TABLE IF NOT EXISTS tpr_pulled (
+          store      TEXT NOT NULL,
+          item_key   TEXT NOT NULL,
+          ends       DATE NOT NULL,
+          description TEXT,
+          pulled_by  TEXT,
+          pulled_at  TIMESTAMPTZ DEFAULT NOW(),
+          PRIMARY KEY (store, item_key, ends)
+        );
         CREATE TABLE IF NOT EXISTS item_aisles (
           store       TEXT NOT NULL,
           item_key    TEXT NOT NULL,
@@ -583,21 +608,52 @@ module.exports = function raziModules(app, pool) {
   // ── TPRs ENDING (from the shelf system's BRdata deal feed) ───
   // The shelf API loads C:\brdata\cloudexp\FUTPRICEbatch*.csv every morning.
   // We ask it which deals end today / tomorrow so the clerk can decide in bulk.
-  app.get("/api/tpr/ending", wrap(async (req, res) => {
-    const days = Math.min(Math.max(parseInt(req.query.days || "1", 10) || 1, 0), 7);
+  // Item key used for aisles / seen TPRs: UPC digits without leading zeros, else the name
+  const akey = (upc, desc) => { const d = String(upc || "").replace(/\D/g, "").replace(/^0+/, ""); return d || String(desc || "").toLowerCase().slice(0, 120); };
+  const D10 = v => (v ? String(v).slice(0, 10) : null);
+  async function shelfFetch(days, code) {
     const base = (process.env.SHELF_API_URL || "https://razi-shelf-api-production.up.railway.app").replace(/\/+$/, "");
-    const code = String(req.query.shelfStore || process.env.SHELF_STORE_CODE || "lindsay");
     const headers = { Accept: "application/json" };
     if (process.env.SHELF_API_TOKEN) headers["X-Shelf-Token"] = process.env.SHELF_API_TOKEN;
-    if (typeof fetch !== "function") return res.status(502).json({ error:"no_fetch", message:"Server cannot call the shelf system" });
-    let j;
+    if (typeof fetch !== "function") return { ok:false, status:"no_fetch" };
     try {
       const ctl = new AbortController(); const t = setTimeout(() => ctl.abort(), 15000);
-      const r = await fetch(`${base}/api/shelf/v1/s/${encodeURIComponent(code)}/expiring?days=${days}`, { headers, signal: ctl.signal });
+      const r = await fetch(`${base}/api/shelf/v1/s/${encodeURIComponent(code || process.env.SHELF_STORE_CODE || "lindsay")}/expiring?days=${days}`, { headers, signal: ctl.signal });
       clearTimeout(t);
-      if (!r.ok) return res.status(502).json({ error:"shelf_" + r.status, message:`Shelf system answered ${r.status}` });
-      j = await r.json();
-    } catch (e) { return res.status(502).json({ error:"shelf_unreachable", message:"Can't reach the shelf system" }); }
+      if (!r.ok) return { ok:false, status:r.status };
+      return { ok:true, j: await r.json() };
+    } catch (e) { return { ok:false, status:"unreachable" }; }
+  }
+  // Remember every TPR we have ever seen, so tags can still be pulled AFTER the deal disappears from the feed
+  async function rememberSeen(store, rows) {
+    for (const x of rows) {
+      const ends = D10(x.ends); if (!ends) continue;
+      try {
+        await pool.query(
+          `INSERT INTO tpr_seen (store,item_key,upc,description,deal_type,starts,ends,sale_price,retail,qty,zone)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+           ON CONFLICT (store,item_key,ends) DO UPDATE SET last_seen=NOW(), description=EXCLUDED.description, sale_price=EXCLUDED.sale_price, retail=EXCLUDED.retail, zone=COALESCE(EXCLUDED.zone, tpr_seen.zone)`,
+          [store, akey(x.upc, x.description), String(x.upc || "").slice(0, 30), String(x.description || x.upc || "").slice(0, 200), x.deal_type || null, D10(x.starts), ends,
+           x.sale_price == null ? null : x.sale_price, x.retail == null ? null : x.retail, x.qty || 1, x.zone_code || x.aisle || null]);
+      } catch (e) {}
+    }
+  }
+  async function captureSeen() {
+    const r = await shelfFetch(14);
+    if (r.ok) await rememberSeen(DEFAULT_STORE, r.j.expiring || []);
+  }
+  setTimeout(() => { captureSeen().catch(() => {}); setInterval(() => captureSeen().catch(() => {}), 30 * 60 * 1000); }, 20000);
+
+  app.get("/api/tpr/ending", wrap(async (req, res) => {
+    const days = Math.min(Math.max(parseInt(req.query.days || "1", 10) || 1, 0), 7);
+    const sr = await shelfFetch(days, req.query.shelfStore);
+    if (!sr.ok) {
+      if (sr.status === "unreachable") return res.status(502).json({ error:"shelf_unreachable", message:"Can't reach the shelf system" });
+      if (sr.status === "no_fetch") return res.status(502).json({ error:"no_fetch", message:"Server cannot call the shelf system" });
+      return res.status(502).json({ error:"shelf_" + sr.status, message:`Shelf system answered ${sr.status}` });
+    }
+    const j = sr.j;
+    rememberSeen(String(req.query.store || DEFAULT_STORE), j.expiring || []).catch(() => {});
     const today = ptParts().date;
     const items = (j.expiring || []).filter(x => x.ends >= today).map(x => ({
       upc: String(x.upc || ""), description: x.description || x.upc, size: x.size || "",
@@ -625,17 +681,24 @@ module.exports = function raziModules(app, pool) {
     // Fill missing aisles from the list the team has built (item_aisles)
     try {
       const st = String(req.query.store || DEFAULT_STORE);
-      const m = {};
-      (await pool.query("SELECT item_key, zone_code FROM item_aisles WHERE store=$1", [st])).rows.forEach(r => { m[r.item_key] = r.zone_code; });
-      items.forEach(i => { if (!i.zone && !i.aisle) { const z = m[(i.upc || i.description || "").toLowerCase().slice(0, 120)]; if (z) i.zone = z; } });
+      const m = await aisleMap(st);
+      items.forEach(i => { const z = m[akey(i.upc, i.description)] || m[(i.upc || i.description || "").toLowerCase().slice(0, 120)]; if (z) { i.zone = z; i.aisle = z; } });
     } catch (e) {}
     res.json({ today, days, count: items.length, items });
   }));
 
-  // ── ITEM AISLES: the team assigns an aisle to items that have none ──
+  // ── ITEM AISLES: the team assigns / corrects the aisle of any item ──
+  async function aisleMap(store) {
+    const m = {};
+    (await pool.query("SELECT item_key, upc, description, zone_code FROM item_aisles WHERE store=$1 ORDER BY set_at", [store])).rows.forEach(r => {
+      m[r.item_key] = r.zone_code; m[akey(r.upc, r.description)] = r.zone_code;
+    });
+    return m;
+  }
+  app.get("/api/item-aisle/map", wrap(async (req, res) => { res.json({ map: await aisleMap(req.query.store || DEFAULT_STORE) }); }));
   app.post("/api/item-aisle", wrap(async (req, res) => {
     const { store = DEFAULT_STORE, upc = "", description = "", zone, clerkName } = req.body || {};
-    const key = String(upc || description || "").toLowerCase().slice(0, 120);
+    const key = akey(upc, description);
     if (!key || !zone) return res.status(400).json({ error:"bad_request", message:"Item and aisle required" });
     const z = (await pool.query("SELECT 1 FROM aisle_zones WHERE store=$1 AND code=$2", [store, String(zone)])).rows.length;
     if (!z) return res.status(400).json({ error:"bad_zone", message:"Unknown aisle" });
@@ -652,6 +715,65 @@ module.exports = function raziModules(app, pool) {
       const q = v => '"' + String(v == null ? "" : v).replace(/"/g, '""') + '"';
       res.type("text/csv").send("upc,description,aisle,set_by,set_at\n" + r.rows.map(x => [x.upc, x.description, x.zone_code, x.set_by, x.set_at && x.set_at.toISOString()].map(q).join(",")).join("\n"));
     } else res.json({ count: r.rows.length, rows: r.rows });
+  }));
+
+  // ── Is this item on TPR / ad? (looks at every deal ending in the next 60 days) ──
+  let lookupCache = { at: 0, map: {} };
+  app.post("/api/tpr/lookup", wrap(async (req, res) => {
+    if (Date.now() - lookupCache.at > 10 * 60 * 1000) {
+      const r = await shelfFetch(60);
+      if (r.ok) {
+        const map = {};
+        (r.j.expiring || []).forEach(x => {
+          const k = akey(x.upc, ""); if (!k) return;
+          const cur = map[k];
+          if (!cur || String(x.ends) < String(cur.ends)) map[k] = { type: x.deal_type, starts: D10(x.starts), ends: D10(x.ends), salePrice: x.sale_price };
+        });
+        lookupCache = { at: Date.now(), map };
+      } else if (!Object.keys(lookupCache.map).length) return res.status(502).json({ error:"shelf", message:"Shelf system not answering" });
+    }
+    const out = {};
+    (Array.isArray(req.body && req.body.upcs) ? req.body.upcs : []).slice(0, 500).forEach(u => { const k = akey(u, ""); if (k && lookupCache.map[k]) out[String(u)] = lookupCache.map[k]; });
+    res.json({ today: ptParts().date, map: out });
+  }));
+
+  // ── TPR TAGS TO TAKE DOWN: deals that ended (or end today) and whose shelf tag is still up ──
+  app.get("/api/tpr/tags-down", wrap(async (req, res) => {
+    const store = String(req.query.store || DEFAULT_STORE);
+    const today = ptParts().date;
+    const since = addDays(today, -6);
+    const seen = (await pool.query("SELECT item_key, upc, description, deal_type, ends::text AS ends, sale_price, retail, zone FROM tpr_seen WHERE store=$1 AND ends BETWEEN $2::date AND $3::date ORDER BY ends", [store, since, today])).rows;
+    const pulled = new Set((await pool.query("SELECT item_key||'|'||ends::text AS k FROM tpr_pulled WHERE store=$1 AND ends >= $2::date", [store, since])).rows.map(r => r.k));
+    const decs = (await pool.query("SELECT upc, description, decision, new_end_date::text AS ned, run_date FROM tpr_decisions WHERE store=$1 AND run_date >= $2::date ORDER BY run_date, created_at", [store, since])).rows;
+    const latest = {}; decs.forEach(d => { latest[akey(d.upc, d.description)] = d; });
+    const am = await aisleMap(store);
+    const out = { ended: [], today: [] };
+    seen.forEach(r => {
+      if (pulled.has(r.item_key + "|" + r.ends)) return;
+      const d = latest[r.item_key];
+      if (d && d.decision === "brdata") return;
+      if (d && d.decision === "continue" && d.ned && d.ned > r.ends) return;
+      const it = { key: r.item_key, upc: r.upc, description: r.description, type: r.deal_type, ends: r.ends,
+        salePrice: r.sale_price == null ? null : Number(r.sale_price), retail: r.retail == null ? null : Number(r.retail),
+        aisle: am[r.item_key] || r.zone || "", decided: d ? d.decision : null };
+      (r.ends < today ? out.ended : out.today).push(it);
+    });
+    res.json({ today, ended: out.ended, todayList: out.today });
+  }));
+  app.post("/api/tpr/tag-down", wrap(async (req, res) => {
+    const { store = DEFAULT_STORE, items, clerkName } = req.body || {};
+    if (!Array.isArray(items) || !items.length) return res.status(400).json({ error:"bad_request", message:"No items" });
+    let n = 0;
+    for (const it of items.slice(0, 300)) {
+      const ends = D10(it.ends); const key = it.key || akey(it.upc, it.description);
+      if (!ends || !key) continue;
+      await pool.query(
+        `INSERT INTO tpr_pulled (store,item_key,ends,description,pulled_by) VALUES ($1,$2,$3,$4,$5)
+         ON CONFLICT (store,item_key,ends) DO UPDATE SET pulled_by=EXCLUDED.pulled_by, pulled_at=NOW()`,
+        [store, key, ends, String(it.description || "").slice(0, 200), clerkName || null]);
+      n++;
+    }
+    res.json({ ok:true, saved:n });
   }));
 
   // Bulk decision: many items at once, one lead PIN, one Telegram message.
@@ -950,6 +1072,10 @@ module.exports = function raziModules(app, pool) {
     if (!run) L.push("⚠️ <b>No shift was started in Razi-Nova today.</b>");
     else if (data.shift.confirmedAt) L.push(`✅ Shift confirmed by <b>${esc(data.shift.confirmedBy)}</b> at ${fmtTime(data.shift.confirmedAt)}`);
     else L.push("⚠️ <b>Shift NOT confirmed</b> — clerk never pressed End of Shift");
+    const tm = state.timing || {};
+    const mins = i => { const t = tm[i]; if (!t || !t.start || !t.end) return null; const m = Math.round((new Date(t.end) - new Date(t.start)) / 60000); return m >= 0 && m < 1000 ? m : null; };
+    const timeLine = STEP_LABELS.map((l, i) => { const m = mins(i); return m == null ? null : `${esc(l)} ${m}m`; }).filter(Boolean);
+    if (timeLine.length) L.push("⏱ " + timeLine.join(" · "));
     if (run) L.push(`Steps: ${stepsDone.length}/${STEP_LABELS.length} done` + (stepsDone.length < STEP_LABELS.length ? ` — missing: ${STEP_LABELS.filter((s, i) => !stepsDone.includes(i)).map(esc).join(", ")}` : ""));
     if (data.shift.incomplete && data.shift.incomplete.length) L.push(`Left unfinished: ${data.shift.incomplete.map(esc).join("; ")}`);
     if (data.shift.note) L.push(`Clerk note: ${esc(data.shift.note)}`);
